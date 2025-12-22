@@ -1,5 +1,8 @@
-  function calculateDiscount(price: number, coupon?: string): number {
+  function calculateDiscount(price: number): number {
   return price * 0.1;
 }
+/* test*/
+/* test*/
+/* test*/
 /* test*/
 
