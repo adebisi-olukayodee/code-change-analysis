@@ -108,6 +108,18 @@ class ConfigurationManager {
             onHighImpactChanges: true
         });
     }
+    /**
+     * Get baseline mode: 'local' (HEAD) or 'pr' (merge-base)
+     */
+    getBaselineMode() {
+        return this.get('baselineMode', 'local');
+    }
+    /**
+     * Get PR target branch for merge-base calculation
+     */
+    getPrTargetBranch() {
+        return this.get('prTargetBranch', 'origin/main');
+    }
 }
 exports.ConfigurationManager = ConfigurationManager;
 //# sourceMappingURL=ConfigurationManager.js.map

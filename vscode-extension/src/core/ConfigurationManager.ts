@@ -107,4 +107,18 @@ export class ConfigurationManager {
             onHighImpactChanges: true
         });
     }
+
+    /**
+     * Get baseline mode: 'local' (HEAD) or 'pr' (merge-base)
+     */
+    getBaselineMode(): 'local' | 'pr' {
+        return this.get('baselineMode', 'local');
+    }
+
+    /**
+     * Get PR target branch for merge-base calculation
+     */
+    getPrTargetBranch(): string {
+        return this.get('prTargetBranch', 'origin/main');
+    }
 }

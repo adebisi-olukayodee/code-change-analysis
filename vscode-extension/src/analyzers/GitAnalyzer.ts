@@ -10,22 +10,93 @@ export interface GitChanges {
 }
 
 export class GitAnalyzer {
+    // Cache repo root by the repo root itself (or gitDir) to avoid repeated git rev-parse calls
+    // Key: normalized repo root path, Value: repo root (for quick lookup)
+    // Also cache by gitDir for submodule/nested repo detection
+    private repoRootCache: Map<string, string> = new Map();
+    private gitDirCache: Map<string, string> = new Map(); // gitDir -> repoRoot
+
     constructor() {
         // No initialization needed for simple git commands
     }
 
+    /**
+     * Resolve Git repo root for a file path (with caching)
+     * Step 1: Resolve Git repo root using git -C <fileDir> rev-parse --show-toplevel
+     */
+    private async resolveRepoRoot(filePath: string): Promise<string | null> {
+        const fileDir = path.dirname(filePath);
+        
+        try {
+            // First, try to get gitDir to check cache
+            const gitDir = await this.execGitCommand(['rev-parse', '--git-dir'], fileDir);
+            if (gitDir) {
+                const normalizedGitDir = path.resolve(gitDir.trim());
+                // Check if we've seen this gitDir before
+                const cached = this.gitDirCache.get(normalizedGitDir);
+                if (cached) {
+                    return cached;
+                }
+            }
+
+            // Get repo root using git -C <fileDir> rev-parse --show-toplevel
+            // Using -C ensures we run from the file's directory
+            const gitRoot = await this.execGitCommand(['-C', fileDir, 'rev-parse', '--show-toplevel']);
+            if (!gitRoot) {
+                return null;
+            }
+
+            const normalizedRoot = path.resolve(gitRoot.trim());
+            
+            // Cache by the repo root itself (all files in same repo share same root)
+            this.repoRootCache.set(normalizedRoot, normalizedRoot);
+            
+            // Also cache by gitDir if we got it
+            if (gitDir) {
+                const normalizedGitDir = path.resolve(gitDir.trim());
+                this.gitDirCache.set(normalizedGitDir, normalizedRoot);
+            }
+            
+            return normalizedRoot;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    /**
+     * Convert absolute FS path → repo-relative path (normalized for Git)
+     * Step 2: Convert absolute FS path → repo-relative path
+     */
+    private normalizePathForGit(repoRoot: string, filePath: string): string {
+        // Resolve both paths to absolute paths to ensure correct relative calculation
+        const absRepoRoot = path.resolve(repoRoot);
+        const absFilePath = path.resolve(filePath);
+        
+        const relativePath = path.relative(absRepoRoot, absFilePath);
+        
+        // Handle edge case: if file is at repo root, relativePath might be just the filename
+        // Handle edge case: if paths are the same, return empty (shouldn't happen for files)
+        if (!relativePath || relativePath === '.' || relativePath === '') {
+            // File is at repo root or same as root
+            const fileName = path.basename(filePath);
+            return fileName;
+        }
+        
+        // Normalize to forward slashes for Git commands (works on all platforms)
+        // Optional: strip leading ./ (harmless either way, but cleaner)
+        return relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
+    }
+
     async getFileChanges(filePath: string): Promise<GitChanges | undefined> {
         try {
-            // Check if we're in a git repository
-            if (!await this.isGitRepository()) {
+            // Step 1: Resolve Git repo root
+            const repoRoot = await this.resolveRepoRoot(filePath);
+            if (!repoRoot) {
                 return undefined;
             }
 
-            // Get the relative path from git root
-            const gitRoot = await this.execGitCommand(['rev-parse', '--show-toplevel']);
-            if (!gitRoot) return undefined;
-            
-            const relativePath = path.relative(gitRoot.trim(), filePath);
+            // Step 2: Convert to repo-relative path (normalized)
+            const relativePath = this.normalizePathForGit(repoRoot, filePath);
 
             // Get the status of the file
             const status = await this.getGitStatus();
@@ -103,21 +174,22 @@ export class GitAnalyzer {
 
     async getDiffForFile(filePath: string): Promise<string | undefined> {
         try {
-            if (!await this.isGitRepository()) {
+            // Step 1: Resolve Git repo root
+            const repoRoot = await this.resolveRepoRoot(filePath);
+            if (!repoRoot) {
                 return undefined;
             }
 
-            const gitRoot = await this.execGitCommand(['rev-parse', '--show-toplevel']);
-            if (!gitRoot) return undefined;
-            
-            const relativePath = path.relative(gitRoot.trim(), filePath);
+            // Step 2: Convert to repo-relative path (normalized)
+            const relativePath = this.normalizePathForGit(repoRoot, filePath);
 
+            // Step 3: Use that path in Git commands
             // First check for unstaged changes
-            let diff = await this.execGitCommand(['diff', relativePath]);
+            let diff = await this.execGitCommand(['diff', '--', relativePath], repoRoot);
             
             // If no unstaged changes, check for staged changes
             if (!diff || diff.trim().length === 0) {
-                diff = await this.execGitCommand(['diff', '--staged', relativePath]);
+                diff = await this.execGitCommand(['diff', '--staged', '--', relativePath], repoRoot);
             }
             
             // If still no diff, check if file is untracked (new file)
@@ -184,20 +256,44 @@ export class GitAnalyzer {
         }
     }
 
+    /**
+     * Get Git repository root for a path
+     */
+    async getRepoRoot(cwd?: string): Promise<string | null> {
+        try {
+            const searchPath = cwd || this.getDefaultWorkspaceRoot() || '';
+            // Check cache first
+            const cached = this.repoRootCache.get(searchPath);
+            if (cached) {
+                return cached;
+            }
+
+            const result = await this.execGitCommand(['rev-parse', '--show-toplevel'], searchPath);
+            if (result) {
+                const normalized = result.trim();
+                this.repoRootCache.set(searchPath, normalized);
+                return normalized;
+            }
+            return null;
+        } catch (error) {
+            return null;
+        }
+    }
+
     async isFileUntracked(filePath: string): Promise<boolean> {
         try {
-            if (!await this.isGitRepository()) {
+            // Step 1: Resolve Git repo root
+            const repoRoot = await this.resolveRepoRoot(filePath);
+            if (!repoRoot) {
                 return true; // If not in Git repo, consider untracked
             }
 
-            const gitRoot = await this.execGitCommand(['rev-parse', '--show-toplevel']);
-            if (!gitRoot) return true;
+            // Step 2: Convert to repo-relative path (normalized)
+            const relativePath = this.normalizePathForGit(repoRoot, filePath);
             
-            const relativePath = path.relative(gitRoot.trim(), filePath);
-            
-            // Check if file is tracked in Git
+            // Step 3: Use that path in Git command
             // ls-files returns the file path if tracked, or nothing if untracked
-            const result = await this.execGitCommand(['ls-files', '--error-unmatch', '--', relativePath]);
+            const result = await this.execGitCommand(['ls-files', '--error-unmatch', '--', relativePath], repoRoot);
             // If command returns null (error), file is untracked
             return result === null;
         } catch (error) {
@@ -207,10 +303,17 @@ export class GitAnalyzer {
     }
 
     private async execGitCommand(args: string[], cwd?: string): Promise<string | null> {
-        const workspaceRoot = cwd ?? this.getDefaultWorkspaceRoot();
-        if (!workspaceRoot) {
+        // Check if -C flag is already in args (git -C <dir> handles cwd internally)
+        const hasCFlag = args.length >= 2 && args[0] === '-C';
+        
+        // If -C flag is present, don't use cwd parameter (git handles it)
+        // Otherwise, use provided cwd or default workspace root
+        const workspaceRoot = hasCFlag ? undefined : (cwd ?? this.getDefaultWorkspaceRoot());
+        
+        if (!hasCFlag && !workspaceRoot) {
             return null;
         }
+        
         return new Promise((resolve) => {
             child_process.exec(`git ${args.join(' ')}`, {
                 cwd: workspaceRoot
@@ -364,15 +467,17 @@ export class GitAnalyzer {
 
     async getFileContentFromHEAD(filePath: string): Promise<string | null> {
         try {
-            if (!await this.isGitRepository()) {
+            // Step 1: Resolve Git repo root
+            const repoRoot = await this.resolveRepoRoot(filePath);
+            if (!repoRoot) {
                 return null;
             }
 
-            const gitRoot = await this.execGitCommand(['rev-parse', '--show-toplevel']);
-            if (!gitRoot) return null;
+            // Step 2: Convert to repo-relative path (normalized)
+            const relativePath = this.normalizePathForGit(repoRoot, filePath);
 
-            const relativePath = path.relative(gitRoot.trim(), filePath);
-            const content = await this.execGitCommand(['show', `HEAD:${relativePath}`]);
+            // Step 3: Use that path in Git command
+            const content = await this.execGitCommand(['show', `HEAD:${relativePath}`], repoRoot);
             return content;
         } catch (error) {
             console.error('Error getting file content from HEAD:', error);
@@ -417,15 +522,17 @@ export class GitAnalyzer {
      */
     async getFileContentFromCommit(filePath: string, commitSha: string): Promise<string | null> {
         try {
-            if (!await this.isGitRepository()) {
+            // Step 1: Resolve Git repo root
+            const repoRoot = await this.resolveRepoRoot(filePath);
+            if (!repoRoot) {
                 return null;
             }
 
-            const gitRoot = await this.execGitCommand(['rev-parse', '--show-toplevel']);
-            if (!gitRoot) return null;
+            // Step 2: Convert to repo-relative path (normalized)
+            const relativePath = this.normalizePathForGit(repoRoot, filePath);
 
-            const relativePath = path.relative(gitRoot.trim(), filePath);
-            const content = await this.execGitCommand(['show', `${commitSha}:${relativePath}`]);
+            // Step 3: Use that path in Git command
+            const content = await this.execGitCommand(['show', `${commitSha}:${relativePath}`], repoRoot);
             return content;
         } catch (error) {
             console.error(`Error getting file content from commit ${commitSha}:`, error);
@@ -438,17 +545,24 @@ export class GitAnalyzer {
      */
     async isFileTracked(filePath: string): Promise<boolean> {
         try {
-            if (!await this.isGitRepository()) {
+            // Step 1: Resolve Git repo root
+            const repoRoot = await this.resolveRepoRoot(filePath);
+            if (!repoRoot) {
+                console.log(`[GitAnalyzer] isFileTracked: No repo root found for ${filePath}`);
                 return false;
             }
 
-            const gitRoot = await this.execGitCommand(['rev-parse', '--show-toplevel']);
-            if (!gitRoot) return false;
+            // Step 2: Convert to repo-relative path (normalized)
+            const relativePath = this.normalizePathForGit(repoRoot, filePath);
+            console.log(`[GitAnalyzer] isFileTracked: repoRoot=${repoRoot}, filePath=${filePath}, relativePath=${relativePath}`);
 
-            const relativePath = path.relative(gitRoot.trim(), filePath);
-            const result = await this.execGitCommand(['ls-files', '--error-unmatch', relativePath]);
-            return result !== null;
+            // Step 3: Use that path in Git command
+            const result = await this.execGitCommand(['ls-files', '--error-unmatch', '--', relativePath], repoRoot);
+            const isTracked = result !== null;
+            console.log(`[GitAnalyzer] isFileTracked: result=${isTracked} for ${relativePath}`);
+            return isTracked;
         } catch (error) {
+            console.error(`[GitAnalyzer] isFileTracked error: ${error}`);
             return false;
         }
     }

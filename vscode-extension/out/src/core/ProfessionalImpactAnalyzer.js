@@ -40,6 +40,11 @@ class ProfessionalImpactAnalyzer {
         // NOTE: This is session-only (in-memory). On extension reload, cache is cleared.
         // This ensures we start fresh after reload, comparing against the current saved state.
         this.baselineCache = new Map();
+        // Baseline ref SHA tracking: key = repoRoot|filePath|baselineMode|targetRef, value = commit SHA
+        this.baselineRefShaByKey = new Map();
+        // Baseline AST cache: key = repoRoot|filePath|commitSha|language, value = cached AST
+        this.baselineASTCache = new Map();
+        this.MAX_AST_CACHE_SIZE = 300; // LRU eviction threshold
         // Debug output channel
         this.debugOutputChannel = null;
         this.configManager = configManager;
@@ -84,6 +89,116 @@ class ProfessionalImpactAnalyzer {
             return openDoc;
         }
         return null;
+    }
+    /**
+     * Generate baseline cache key: repoRoot|filePath|baselineMode|targetRef
+     */
+    async getBaselineCacheKey(filePath) {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        const repoRoot = workspaceFolder ? await this.getRepoRoot(workspaceFolder.uri.fsPath) : '';
+        const baselineMode = this.configManager.getBaselineMode();
+        const targetRef = baselineMode === 'pr' ? this.configManager.getPrTargetBranch() : 'HEAD';
+        return `${repoRoot}|${filePath}|${baselineMode}|${targetRef}`;
+    }
+    /**
+     * Generate AST cache key: repoRoot|filePath|commitSha|language
+     */
+    getASTCacheKey(filePath, commitSha, language) {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        const repoRoot = workspaceFolder ? workspaceFolder.uri.fsPath : '';
+        return `${repoRoot}|${filePath}|${commitSha}|${language}`;
+    }
+    /**
+     * Get Git repository root for a path
+     */
+    async getRepoRoot(startPath) {
+        try {
+            const repoRoot = await this.gitAnalyzer.getRepoRoot(startPath);
+            if (repoRoot) {
+                return repoRoot;
+            }
+        }
+        catch (error) {
+            // Ignore
+        }
+        // Fallback: use workspace root
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        return workspaceFolder ? workspaceFolder.uri.fsPath : '';
+    }
+    /**
+     * Lazy Git state detection: check if HEAD SHA changed since last analysis
+     * Returns true if baseline should be re-resolved
+     */
+    async shouldReResolveBaseline(filePath) {
+        if (!this.configManager.get('gitIntegration', true)) {
+            return false;
+        }
+        try {
+            const baselineKey = await this.getBaselineCacheKey(filePath);
+            const cachedSha = this.baselineRefShaByKey.get(baselineKey);
+            const currentSha = await this.gitAnalyzer.getCurrentCommitSha();
+            if (!cachedSha) {
+                // No cached SHA - first time, will resolve
+                return true;
+            }
+            if (cachedSha !== currentSha) {
+                this.debugLog(`🔄 Baseline SHA changed: ${cachedSha.substring(0, 7)} → ${currentSha?.substring(0, 7) || 'null'}`);
+                return true;
+            }
+            return false;
+        }
+        catch (error) {
+            this.debugLog(`Error checking baseline SHA: ${error}`);
+            return false; // On error, don't force re-resolution
+        }
+    }
+    /**
+     * Evict oldest AST cache entries if over limit (LRU)
+     */
+    evictASTCacheIfNeeded() {
+        if (this.baselineASTCache.size <= this.MAX_AST_CACHE_SIZE) {
+            return;
+        }
+        // Sort by createdAt, remove oldest entries
+        const entries = Array.from(this.baselineASTCache.entries())
+            .sort((a, b) => a[1].createdAt.getTime() - b[1].createdAt.getTime());
+        const toRemove = entries.slice(0, entries.length - this.MAX_AST_CACHE_SIZE);
+        for (const [key] of toRemove) {
+            this.baselineASTCache.delete(key);
+        }
+        this.debugLog(`Evicted ${toRemove.length} AST cache entries (size: ${this.baselineASTCache.size})`);
+    }
+    /**
+     * Check if file is binary (simple heuristic)
+     */
+    async isBinaryFile(filePath) {
+        try {
+            const content = fs.readFileSync(filePath);
+            // Check for null bytes (common in binary files)
+            if (content.includes(0)) {
+                return true;
+            }
+            // Check file extension
+            const ext = path.extname(filePath).toLowerCase();
+            const binaryExts = ['.exe', '.dll', '.so', '.dylib', '.bin', '.jpg', '.jpeg', '.png', '.gif', '.pdf', '.zip', '.tar', '.gz'];
+            return binaryExts.includes(ext);
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
+     * Check if file is too large for AST parsing
+     */
+    isFileTooLarge(filePath, maxSizeMB = 5) {
+        try {
+            const stats = fs.statSync(filePath);
+            const sizeMB = stats.size / (1024 * 1024);
+            return sizeMB > maxSizeMB;
+        }
+        catch {
+            return false;
+        }
     }
     /**
      * Initialize baseline from disk when file is first opened
@@ -179,9 +294,54 @@ class ProfessionalImpactAnalyzer {
             let before = null;
             let baseline;
             let baselineType = 'none';
-            // STEP 1: Try Git baseline first (HEAD or target branch)
+            let baselineRef;
+            let baselineCommitSha;
+            let fallbackReason;
+            // Check for binary or too-large files early
+            const isBinary = await this.isBinaryFile(filePath);
+            if (isBinary) {
+                this.debugLog(`⚠️ Binary file detected - skipping AST analysis`);
+                return {
+                    filePath,
+                    changedFunctions: [],
+                    changedClasses: [],
+                    changedModules: [],
+                    affectedTests: [],
+                    downstreamComponents: [],
+                    confidence: 0,
+                    estimatedTestTime: 0,
+                    coverageImpact: 0,
+                    riskLevel: 'low',
+                    timestamp: new Date(),
+                    hasActualChanges: false,
+                    baselineType: 'none',
+                    baseline: {
+                        refType: 'none',
+                        availability: 'unavailable',
+                        reason: 'binary_file'
+                    },
+                    currentVersion,
+                    parseStatus: {
+                        old: 'not_attempted',
+                        new: 'not_attempted'
+                    }
+                };
+            }
+            const isTooLarge = this.isFileTooLarge(filePath);
+            if (isTooLarge) {
+                this.debugLog(`⚠️ File too large for AST analysis - using lightweight text diff`);
+                // Continue but mark for lightweight diff
+            }
+            // STEP 1: Lazy Git state detection - check if baseline SHA changed
+            const shouldReResolve = await this.shouldReResolveBaseline(filePath);
+            if (shouldReResolve) {
+                this.debugLog(`🔄 Baseline SHA changed - re-resolving baseline`);
+            }
+            // STEP 2: Try Git baseline first (HEAD or target branch)
             if (this.configManager.get('gitIntegration', true)) {
                 try {
+                    const baselineMode = this.configManager.getBaselineMode();
+                    const baselineKey = await this.getBaselineCacheKey(filePath);
                     // Check if file is tracked
                     const isTracked = await this.gitAnalyzer.isFileTracked(filePath);
                     if (!isTracked) {
@@ -191,40 +351,77 @@ class ProfessionalImpactAnalyzer {
                             availability: 'unavailable',
                             reason: 'file_not_tracked'
                         };
+                        fallbackReason = 'file_not_tracked';
                     }
                     else {
-                        // Get HEAD commit SHA for baseline resolution contract
-                        const headSha = await this.gitAnalyzer.getCurrentCommitSha();
-                        const headContent = await this.gitAnalyzer.getFileContentFromHEAD(filePath);
-                        if (headContent && headSha) {
-                            before = headContent;
+                        let commitSha = null;
+                        let gitContent = null;
+                        let refName;
+                        if (baselineMode === 'pr') {
+                            // PR mode: use merge-base
+                            const targetRef = this.configManager.getPrTargetBranch();
+                            refName = targetRef;
+                            const mergeBaseSha = await this.gitAnalyzer.getMergeBase(targetRef);
+                            if (mergeBaseSha) {
+                                commitSha = mergeBaseSha;
+                                gitContent = await this.gitAnalyzer.getFileContentFromCommit(filePath, mergeBaseSha);
+                                baselineType = 'git:mergeBase';
+                                baselineRef = targetRef;
+                            }
+                            else {
+                                // Merge-base failed - fall back to HEAD
+                                this.debugLog(`⚠️ Merge-base unavailable, falling back to HEAD`);
+                                fallbackReason = 'merge_base_unavailable';
+                                commitSha = await this.gitAnalyzer.getCurrentCommitSha();
+                                gitContent = await this.gitAnalyzer.getFileContentFromHEAD(filePath);
+                                baselineType = 'git:HEAD';
+                                baselineRef = 'HEAD';
+                            }
+                        }
+                        else {
+                            // Local mode: use HEAD
+                            refName = 'HEAD';
+                            commitSha = await this.gitAnalyzer.getCurrentCommitSha();
+                            gitContent = await this.gitAnalyzer.getFileContentFromHEAD(filePath);
                             baselineType = 'git:HEAD';
+                            baselineRef = 'HEAD';
+                        }
+                        if (gitContent && commitSha) {
+                            before = gitContent;
+                            baselineCommitSha = commitSha;
+                            // Store baseline SHA for future comparison
+                            this.baselineRefShaByKey.set(baselineKey, commitSha);
                             baseline = {
-                                refType: 'git:HEAD',
-                                commitSha: headSha,
+                                refType: baselineType,
+                                refName: refName,
+                                commitSha: commitSha,
                                 availability: 'available'
                             };
-                            this.debugLog(`✅ Using Git HEAD as baseline (${before.length} chars, SHA: ${headSha.substring(0, 7)})`);
-                            (0, debug_logger_1.debugLog)(`[BASELINE] Using Git HEAD (${headSha.substring(0, 7)})`);
-                            console.log(`[BASELINE] Git HEAD found - using as baseline (${headSha.substring(0, 7)})`);
+                            this.debugLog(`✅ Using Git ${baselineType} as baseline (${before.length} chars, SHA: ${commitSha.substring(0, 7)}, ref: ${refName})`);
+                            (0, debug_logger_1.debugLog)(`[BASELINE] Using Git ${baselineType} (${commitSha.substring(0, 7)})`);
+                            console.log(`[BASELINE] Git ${baselineType} found - using as baseline (${commitSha.substring(0, 7)})`);
                         }
-                        else if (!headContent && headSha) {
-                            // File exists in repo but not at HEAD (deleted/renamed)
+                        else if (!gitContent && commitSha) {
+                            // File exists in repo but not at this ref (deleted/renamed)
                             baseline = {
-                                refType: 'git:HEAD',
-                                commitSha: headSha,
+                                refType: baselineType,
+                                refName: refName,
+                                commitSha: commitSha,
                                 availability: 'unavailable',
-                                reason: 'file_not_at_head'
+                                reason: 'file_not_at_ref'
                             };
-                            this.debugLog(`⚠️ File not found at HEAD (${headSha.substring(0, 7)}) - will try cached baseline`);
+                            fallbackReason = 'file_not_at_ref';
+                            this.debugLog(`⚠️ File not found at ${refName} (${commitSha.substring(0, 7)}) - will try cached baseline`);
                         }
                         else {
                             baseline = {
-                                refType: 'git:HEAD',
+                                refType: baselineType,
+                                refName: refName,
                                 availability: 'unavailable',
                                 reason: 'git_ref_unavailable'
                             };
-                            this.debugLog(`⚠️ Git HEAD unavailable - will try cached baseline`);
+                            fallbackReason = 'git_ref_unavailable';
+                            this.debugLog(`⚠️ Git ${refName} unavailable - will try cached baseline`);
                         }
                     }
                 }
@@ -234,8 +431,9 @@ class ProfessionalImpactAnalyzer {
                     baseline = {
                         refType: 'git:HEAD',
                         availability: 'unavailable',
-                        reason: `git_error: ${error}`
+                        reason: `git_error: ${String(error)}`
                     };
+                    fallbackReason = `git_error: ${String(error)}`;
                 }
             }
             else {
@@ -245,8 +443,9 @@ class ProfessionalImpactAnalyzer {
                     availability: 'unavailable',
                     reason: 'git_integration_disabled'
                 };
+                fallbackReason = 'git_integration_disabled';
             }
-            // STEP 2: Fall back to last-saved snapshot (baseline cache) if Git unavailable
+            // STEP 3: Fall back to last-saved snapshot (baseline cache) if Git unavailable
             // Snapshot mode flow:
             // 1. First analysis (no cache): Initialize baseline from disk, store in cache, return empty (or analyze if changes)
             // 2. On save (has cache): Use cached baseline (previous saved state) vs current saved content
@@ -260,9 +459,12 @@ class ProfessionalImpactAnalyzer {
                     baseline = {
                         refType: 'snapshot:lastSave',
                         availability: 'available',
-                        reason: baseline?.reason ? `fallback_from_${baseline.reason}` : 'using_cached_snapshot'
+                        reason: fallbackReason ? `fallback_from_${fallbackReason}` : 'using_cached_snapshot'
                     };
                     this.debugLog(`✅ Using cached baseline (${before.length} chars) - previous saved state`);
+                    if (fallbackReason) {
+                        this.debugLog(`   Fallback reason: ${fallbackReason}`);
+                    }
                     (0, debug_logger_1.debugLog)(`[BASELINE] Using cached snapshot (previous save)`);
                     console.log(`[BASELINE] Using cached baseline (previous save)`);
                 }
@@ -410,7 +612,12 @@ class ProfessionalImpactAnalyzer {
                     timestamp: new Date(),
                     hasActualChanges: false,
                     baselineType,
-                    baseline,
+                    baseline: {
+                        ...baseline,
+                        refName: baselineRef,
+                        commitSha: baselineCommitSha,
+                        reason: fallbackReason || baseline?.reason
+                    },
                     currentVersion,
                     parseStatus: {
                         old: 'not_attempted',
@@ -540,7 +747,12 @@ class ProfessionalImpactAnalyzer {
                 gitChanges,
                 hasActualChanges: true,
                 baselineType,
-                baseline,
+                baseline: {
+                    ...baseline,
+                    refName: baselineRef,
+                    commitSha: baselineCommitSha,
+                    reason: fallbackReason || baseline?.reason
+                },
                 currentVersion,
                 parseStatus
             };
