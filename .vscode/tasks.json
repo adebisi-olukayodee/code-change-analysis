@@ -4,7 +4,11 @@
     {
       "type": "npm",
       "script": "compile",
-      "group": "build",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "label": "npm: compile",
       "presentation": {
         "panel": "shared",
         "reveal": "silent"
