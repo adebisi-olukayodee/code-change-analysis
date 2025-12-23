@@ -42,6 +42,12 @@ export class CiResultsManager implements vscode.Disposable {
             return;
         }
 
+        // Skip if CI polling is disabled (unless manually triggered)
+        if (!manual && !this.configurationManager.isCiPollingEnabled()) {
+            this.log('[CI] CI polling disabled, skipping refresh');
+            return;
+        }
+
         if (this.isRefreshing) {
             if (manual) {
                 this.pendingRefresh = true;
@@ -122,10 +128,16 @@ export class CiResultsManager implements vscode.Disposable {
             this.lastRefreshAt = payload.fetchedAt;
             this.log(`[CI] Updated CI view with ${builds.length} build(s) for commit ${commitHash.substring(0, 8)}`);
         } catch (error) {
-            console.error('[Impact Analyzer] Failed to refresh CI results:', error);
-            this.log(`[CI] Error refreshing CI results: ${error instanceof Error ? error.message : String(error)}`);
-            if (error instanceof Error) {
-                vscode.window.showWarningMessage(`Impact Analyzer: Failed to refresh CI results - ${error.message}`);
+            // Only log/show errors if CI polling is enabled
+            if (this.configurationManager.isCiPollingEnabled()) {
+                console.error('[Impact Analyzer] Failed to refresh CI results:', error);
+                this.log(`[CI] Error refreshing CI results: ${error instanceof Error ? error.message : String(error)}`);
+                if (error instanceof Error) {
+                    vscode.window.showWarningMessage(`Impact Analyzer: Failed to refresh CI results - ${error.message}`);
+                }
+            } else {
+                // CI polling is disabled, just log silently
+                this.log(`[CI] CI polling disabled, skipping refresh`);
             }
         } finally {
             this.isRefreshing = false;

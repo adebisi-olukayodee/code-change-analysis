@@ -86,6 +86,11 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
                    element.type === 'sub-metrics' || element.type === 'sub-metric-detail' ||
                    element.type === 'breaking-issues' || element.type === 'breaking-issue' ||
                    element.type === 'breaking-category' || element.type === 'breaking-fixes' ||
+                   element.type === 'ts-breaking-change' || element.type === 'ts-breaking-detail' ||
+                   element.type === 'breaking-change' || element.type === 'breaking-change-evidence' ||
+                   element.type === 'breaking-change-impact' || element.type === 'breaking-change-actions' ||
+                   element.type === 'breaking-change-location' || element.type === 'breaking-change-impact-files' ||
+                   element.type === 'breaking-change-impact-tests' || element.type === 'breaking-change-impact-usage' ||
                    element.type === 'fix' || element.type === 'run-tests' || 
                    element.type === 'run-single-test' || element.type === 'separator' ||
                    element.type === 'test-result-error' || element.type === 'test-result-stack' ||
@@ -985,17 +990,81 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
             return items;
         }
 
-        // WHAT WILL BREAK - Show critical issues first (EXPANDED by default)
-        const breakingIssues = this.extractBreakingIssues(result);
-        if (breakingIssues.length > 0) {
+        // WHAT WILL BREAK - Show TypeScript breaking changes first (EXPANDED by default)
+        // IMPORTANT: Only count breakingChanges, never count impacts as separate issues
+        const tsBreakingChanges = Array.isArray(result.breakingChanges) ? result.breakingChanges : [];
+        // Only extract legacy breaking issues if we don't have TypeScript breaking changes
+        const legacyBreakingIssues = tsBreakingChanges.length === 0 ? this.extractBreakingIssues(result) : [];
+        
+        // DEBUG: Log what we're working with
+        console.log(`[UI] Breaking changes count: ${tsBreakingChanges.length}, Legacy issues: ${legacyBreakingIssues.length}`);
+        
+        if (tsBreakingChanges.length > 0) {
+            // Calculate risk level from breaking changes
+            const riskLevel = this.calculateRiskFromBreakingChanges(tsBreakingChanges);
+            const riskLabel = riskLevel === 'high' ? 'High risk' : riskLevel === 'medium' ? 'Medium risk' : 'Low risk';
+            
+            // Count impacts across all breaking changes (for summary, not for issue count)
+            const totalImpactedFiles = new Set<string>();
+            const totalImpactedTests = new Set<string>();
+            const totalAffectedFunctions = new Set<string>();
+            
+            for (const change of tsBreakingChanges) {
+                (change.impactedFiles || []).forEach((f: string) => totalImpactedFiles.add(f));
+                (change.impactedTests || []).forEach((t: string) => totalImpactedTests.add(t));
+                if (change.symbolKind === 'function' || change.symbolKind === 'method') {
+                    totalAffectedFunctions.add(change.symbolName);
+                }
+            }
+            
+            // Build impact summary for display (not for counting)
+            const impactParts: string[] = [];
+            if (totalAffectedFunctions.size > 0) {
+                impactParts.push(`${totalAffectedFunctions.size} function${totalAffectedFunctions.size !== 1 ? 's' : ''}`);
+            }
+            if (totalImpactedTests.size > 0) {
+                impactParts.push(`${totalImpactedTests.size} test${totalImpactedTests.size !== 1 ? 's' : ''}`);
+            }
+            if (totalImpactedFiles.size > 0) {
+                impactParts.push(`${totalImpactedFiles.size} downstream`);
+            }
+            
+            // Use appropriate icon and label based on severity
+            const isCritical = riskLevel === 'high';
             const breakingItem = new ImpactViewItem(
-                `🚨 What Will Break (${breakingIssues.length})`,
+                `${isCritical ? '🚨' : '⚠️'} What Will Break (${tsBreakingChanges.length})`,
                 'breaking-issues',
                 vscode.TreeItemCollapsibleState.Expanded // Expanded by default to show immediately
             );
-            breakingItem.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('errorForeground'));
-            breakingItem.analysisResult = { breakingIssues, result };
-            breakingItem.description = `${breakingIssues.length} critical issue(s)`;
+            
+            // Color code based on risk level - use warning (yellow) for medium, error (red) only for high
+            const riskColor = riskLevel === 'high' 
+                ? new vscode.ThemeColor('errorForeground')
+                : riskLevel === 'medium'
+                ? new vscode.ThemeColor('warningForeground')
+                : new vscode.ThemeColor('textLinkForeground');
+            
+            // Use error icon for critical, warning icon for medium/low
+            const iconName = isCritical ? 'error' : 'warning';
+            breakingItem.iconPath = new vscode.ThemeIcon(iconName, riskColor);
+            breakingItem.analysisResult = { breakingChanges: tsBreakingChanges, result, riskLevel };
+            
+            // Format: "1 breaking change (Medium risk)" - impacts shown separately in tooltip
+            const severityText = riskLevel === 'high' ? 'Critical' : riskLevel === 'medium' ? 'Medium' : 'Low';
+            breakingItem.description = `${tsBreakingChanges.length} breaking change${tsBreakingChanges.length !== 1 ? 's' : ''} (${severityText} risk)`;
+            breakingItem.tooltip = this.buildBreakingChangesTooltip(tsBreakingChanges, result, riskLevel, totalImpactedFiles.size, totalImpactedTests.size, totalAffectedFunctions.size);
+            items.push(breakingItem);
+        } else if (legacyBreakingIssues.length > 0) {
+            // Fallback to legacy breaking issues if no TypeScript breaking changes
+            // Legacy issues are treated as critical by default
+            const breakingItem = new ImpactViewItem(
+                `🚨 What Will Break (${legacyBreakingIssues.length})`,
+                'breaking-issues',
+                vscode.TreeItemCollapsibleState.Expanded
+            );
+            breakingItem.iconPath = new vscode.ThemeIcon('error', new vscode.ThemeColor('errorForeground'));
+            breakingItem.analysisResult = { breakingIssues: legacyBreakingIssues, result };
+            breakingItem.description = `${legacyBreakingIssues.length} breaking change${legacyBreakingIssues.length !== 1 ? 's' : ''} (Critical risk)`;
             items.push(breakingItem);
         } else {
             // Show success message if no issues
@@ -1075,20 +1144,87 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
             fileItem.filePath = result.filePath;
             fileItem.analysisResult = { result, entry };
 
-            const breakingIssues = this.extractBreakingIssues(result);
-            const hasBreakingIssues = breakingIssues.length > 0;
-            fileItem.iconPath = hasBreakingIssues
-                ? new vscode.ThemeIcon('warning', new vscode.ThemeColor('errorForeground'))
-                : new vscode.ThemeIcon('check', new vscode.ThemeColor('testing.iconPassed'));
+            // Count breaking changes - check both TypeScript and legacy
+            const tsBreakingChanges = result.breakingChanges || [];
+            const legacyBreakingIssues = tsBreakingChanges.length === 0 ? this.extractBreakingIssues(result) : [];
+            const hasBreakingChanges = tsBreakingChanges.length > 0 || legacyBreakingIssues.length > 0;
+            
+            // Calculate risk level and severity
+            let riskLevel: 'low' | 'medium' | 'high' = 'low';
+            let severityLabel = '';
+            if (hasBreakingChanges) {
+                if (tsBreakingChanges.length > 0) {
+                    riskLevel = this.calculateRiskFromBreakingChanges(tsBreakingChanges);
+                } else {
+                    // Legacy breaking issues are treated as medium risk by default
+                    riskLevel = 'medium';
+                }
+                severityLabel = riskLevel === 'high' ? 'Critical' : riskLevel === 'medium' ? 'Medium' : 'Low';
+            }
+            
+            // Use appropriate icon and color based on risk level
+            if (hasBreakingChanges) {
+                const riskColor = riskLevel === 'high' 
+                    ? new vscode.ThemeColor('errorForeground')
+                    : riskLevel === 'medium'
+                    ? new vscode.ThemeColor('warningForeground')
+                    : new vscode.ThemeColor('textLinkForeground');
+                // Use error icon for critical, warning icon for medium/low
+                const iconName = riskLevel === 'high' ? 'error' : 'warning';
+                fileItem.iconPath = new vscode.ThemeIcon(iconName, riskColor);
+            } else {
+                fileItem.iconPath = new vscode.ThemeIcon('check', new vscode.ThemeColor('testing.iconPassed'));
+            }
 
             const summaryParts: string[] = [];
-            summaryParts.push(hasBreakingIssues
-                ? `${breakingIssues.length} issue${breakingIssues.length !== 1 ? 's' : ''}`
-                : 'No issues');
+            if (hasBreakingChanges) {
+                const totalBreakingChanges = tsBreakingChanges.length > 0 ? tsBreakingChanges.length : legacyBreakingIssues.length;
+                summaryParts.push(`${totalBreakingChanges} breaking change${totalBreakingChanges !== 1 ? 's' : ''}`);
+                if (severityLabel) {
+                    summaryParts.push(`(${severityLabel} risk)`);
+                }
+            } else {
+                summaryParts.push('No breaking changes');
+            }
 
-            const changeSummary = this.buildChangeSummary(result);
-            if (changeSummary) {
-                summaryParts.push(changeSummary);
+            // Don't show change summary if we have breaking changes (it's redundant)
+            // Only show it if there are no breaking changes but there are other changes
+            if (!hasBreakingChanges) {
+                const changeSummary = this.buildChangeSummary(result);
+                if (changeSummary) {
+                    summaryParts.push(changeSummary);
+                }
+            } else {
+                // For breaking changes, show impact summary instead
+                const tsBreakingChanges = result.breakingChanges || [];
+                if (tsBreakingChanges.length > 0) {
+                    const totalImpactedFiles = new Set<string>();
+                    const totalImpactedTests = new Set<string>();
+                    const totalAffectedFunctions = new Set<string>();
+                    
+                    for (const change of tsBreakingChanges) {
+                        (change.impactedFiles || []).forEach((f: string) => totalImpactedFiles.add(f));
+                        (change.impactedTests || []).forEach((t: string) => totalImpactedTests.add(t));
+                        if (change.symbolKind === 'function' || change.symbolKind === 'method') {
+                            totalAffectedFunctions.add(change.symbolName);
+                        }
+                    }
+                    
+                    const impactParts: string[] = [];
+                    if (totalAffectedFunctions.size > 0) {
+                        impactParts.push(`${totalAffectedFunctions.size} function${totalAffectedFunctions.size !== 1 ? 's' : ''}`);
+                    }
+                    if (totalImpactedTests.size > 0) {
+                        impactParts.push(`${totalImpactedTests.size} test${totalImpactedTests.size !== 1 ? 's' : ''}`);
+                    }
+                    if (totalImpactedFiles.size > 0) {
+                        impactParts.push(`${totalImpactedFiles.size} downstream`);
+                    }
+                    
+                    if (impactParts.length > 0) {
+                        summaryParts.push(`Affects ${impactParts.join(', ')}`);
+                    }
+                }
             }
 
             if (entry.delta && this.deltaHasChanges(entry.delta)) {
@@ -1210,51 +1346,15 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
             )
             : [];
 
-        // Downstream components that depend on changed code
-        if (uniqueDownstream.length > 0) {
-            for (const component of uniqueDownstream) {
-                breakingIssues.push({
-                    severity: '⚠️ Risk',
-                    message: `Depends on changed code: ${require('path').basename(component)}`,
-                    line: 0,
-                    category: 'Downstream Impact',
-                    file: component,
-                    recommendedFixes: [
-                        `Review ${require('path').basename(component)} to ensure compatibility`,
-                        'Run tests for dependent components',
-                        'Update dependent code if API contract changed',
-                        'Check for compilation/runtime errors in dependent files',
-                        'Consider staging changes to avoid cascading failures'
-                    ]
-                });
-            }
-        }
+        // IMPORTANT: Only count actual breaking changes (changed functions/classes), NOT impacts
+        // Impacts (downstream, tests) are shown as context, not as separate breaking issues
         
-        // Test Impact - Affected tests that might fail (included in "What Will Break")
-        if (uniqueAffectedTests.length > 0) {
-            for (const test of uniqueAffectedTests) {
-                breakingIssues.push({
-                    severity: '🧪 Test Risk',
-                    message: `Test may fail: ${require('path').basename(test)}`,
-                    line: 0,
-                    category: 'Test Impact',
-                    file: test,
-                    recommendedFixes: [
-                        `Run ${require('path').basename(test)} to verify it passes`,
-                        'Update test expectations if behavior changed intentionally',
-                        'Add test coverage for new functionality if missing',
-                        'Fix test assertions if they are now incorrect',
-                        'Consider adding integration tests for affected workflows'
-                    ]
-                });
-            }
-        }
-        
-        // Changed functions/classes that other code depends on
+        // Changed functions/classes that other code depends on - these are the actual breaking changes
         if (uniqueChangedFunctions.length > 0) {
+            // Only count if there are downstream components (indicating other code depends on it)
+            // Count as 1 breaking change per changed function, not per impact
             for (const func of uniqueChangedFunctions) {
-                // Only show if there are downstream components (indicating other code depends on it)
-                if (uniqueDownstream.length > 0) {
+                if (uniqueDownstream.length > 0 || uniqueAffectedTests.length > 0) {
                     breakingIssues.push({
                         severity: '⚠️ Breaking Change',
                         message: `Function changed: ${func} (may break callers)`,
@@ -1274,9 +1374,9 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
         }
         
         if (uniqueChangedClasses.length > 0) {
+            // Only count if there are downstream components (indicating other code depends on it)
             for (const cls of uniqueChangedClasses) {
-                // Only show if there are downstream components (indicating other code depends on it)
-                if (uniqueDownstream.length > 0) {
+                if (uniqueDownstream.length > 0 || uniqueAffectedTests.length > 0) {
                     breakingIssues.push({
                         severity: '⚠️ Breaking Change',
                         message: `Class changed: ${cls} (may break dependents)`,
@@ -1375,10 +1475,41 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
         const result = inferredResult;
 
         if (detailElement.type === 'breaking-issues') {
+            // Check for TypeScript breaking changes first
+            const breakingChanges = context.breakingChanges || [];
             const breakingIssues = context.breakingIssues || [];
             const filePath = context.result?.filePath || inferredResult?.filePath || '';
+            const riskLevel = context.riskLevel || 'medium';
             
-            if (breakingIssues.length === 0) {
+            // DEBUG: Log what we're working with in detail view
+            console.log(`[UI Detail] Breaking changes: ${breakingChanges.length}, Breaking issues: ${breakingIssues.length}`);
+            
+            if (breakingChanges.length > 0) {
+                // Display TypeScript breaking changes in enhanced format
+                for (let i = 0; i < breakingChanges.length; i++) {
+                    const change = breakingChanges[i];
+                    
+                    // Build the breaking change node with proper label and description
+                    const changeItem = new ImpactViewItem(
+                        this.formatBreakingChangeNodeLabel(change),
+                        'breaking-change',
+                        vscode.TreeItemCollapsibleState.Collapsed
+                    );
+                    changeItem.description = this.formatBreakingChangeNodeDescription(change);
+                    changeItem.tooltip = this.buildBreakingChangeTooltip(change, filePath);
+                    changeItem.analysisResult = { breakingChange: change, filePath, index: i, result };
+                    
+                    // Color code based on risk - use warning (yellow) for medium, error (red) only for high
+                    const isHighRisk = this.isCriticalRule(change.ruleId);
+                    const changeRiskColor = isHighRisk 
+                        ? new vscode.ThemeColor('errorForeground')
+                        : new vscode.ThemeColor('warningForeground');
+                    const changeIcon = isHighRisk ? 'error' : 'warning';
+                    changeItem.iconPath = new vscode.ThemeIcon(changeIcon, changeRiskColor);
+                    
+                    items.push(changeItem);
+                }
+            } else if (breakingIssues.length === 0) {
                 const noIssuesItem = new ImpactViewItem(
                     '✅ No breaking issues detected',
                     'breaking-issue',
@@ -1387,6 +1518,7 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
                 noIssuesItem.iconPath = new vscode.ThemeIcon('check');
                 items.push(noIssuesItem);
             } else {
+                // Fallback to legacy breaking issues display
                 // Group by category
                 const byCategory = new Map<string, typeof breakingIssues>();
                 for (const issue of breakingIssues) {
@@ -1539,6 +1671,421 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
                 }
                 
                 items.push(issueItem);
+            }
+        } else if (detailElement.type === 'breaking-change') {
+            // Display breaking change with Evidence/Impact/Fixes/Location children
+            const breakingChange = context.breakingChange;
+            const filePath = context.filePath || inferredResult?.filePath || '';
+            
+            if (!breakingChange) {
+                return items;
+            }
+
+            // Evidence section
+            const evidence = new ImpactViewItem(
+                'Evidence',
+                'breaking-change-evidence',
+                vscode.TreeItemCollapsibleState.None
+            );
+            evidence.iconPath = new vscode.ThemeIcon('note');
+            evidence.tooltip = this.buildBreakingChangeDetailTooltip(breakingChange);
+            evidence.analysisResult = { breakingChange, filePath };
+            items.push(evidence);
+
+            // Impact section - get data from breaking change or fallback to result
+            const result = context.result || inferredResult;
+            const impactedFiles = breakingChange.impactedFiles || (result ? (result.downstreamComponents || []) : []);
+            const impactedTests = breakingChange.impactedTests || (result ? (result.affectedTests || []) : []);
+            const hasImpacts = (impactedFiles.length > 0) || (impactedTests.length > 0) || (breakingChange.symbolKind === 'function' || breakingChange.symbolKind === 'method');
+            
+            if (hasImpacts) {
+                const impact = new ImpactViewItem(
+                    'Impact',
+                    'breaking-change-impact',
+                    vscode.TreeItemCollapsibleState.Collapsed
+                );
+                impact.description = this.formatImpactSummary(breakingChange);
+                impact.iconPath = new vscode.ThemeIcon('arrow-down');
+                impact.analysisResult = { breakingChange, filePath, result };
+                items.push(impact);
+            }
+
+            // Recommended Fixes section
+            const fixes = new ImpactViewItem(
+                'Recommended Fixes',
+                'breaking-change-actions',
+                vscode.TreeItemCollapsibleState.Collapsed
+            );
+            fixes.description = `${this.getRecommendedActions(breakingChange).length} suggestion(s)`;
+            fixes.iconPath = new vscode.ThemeIcon('lightbulb');
+            fixes.analysisResult = { breakingChange, filePath };
+            items.push(fixes);
+
+            // Location (if available)
+            if (breakingChange.span && breakingChange.span.start >= 0) {
+                const location = new ImpactViewItem(
+                    'Location',
+                    'breaking-change-location',
+                    vscode.TreeItemCollapsibleState.None
+                );
+                location.iconPath = new vscode.ThemeIcon('location');
+                const line = this.getLineNumberFromSpan(breakingChange.span, filePath);
+                location.description = line > 0 ? `Line ${line}` : `Position ${breakingChange.span.start}`;
+                location.analysisResult = { breakingChange, filePath, line };
+                if (line > 0) {
+                    location.command = {
+                        command: 'vscode.open',
+                        title: 'Go to Line',
+                        arguments: [
+                            vscode.Uri.file(filePath),
+                            { selection: new vscode.Range(line - 1, 0, line - 1, 0) }
+                        ]
+                    };
+                }
+                items.push(location);
+            }
+
+            return items;
+        } else if (detailElement.type === 'breaking-change-impact') {
+            // Show impact children: Downstream, Tests, Usages
+            const breakingChange = context.breakingChange;
+            const filePath = context.filePath || '';
+            const result = context.result || inferredResult;
+
+            if (!breakingChange) {
+                return items;
+            }
+
+            // Get impacted files - from breaking change or fallback to result
+            const impactedFiles = breakingChange.impactedFiles || (result ? (result.downstreamComponents || []) : []);
+            console.log(`[UI Impact] Impacted files: ${impactedFiles.length}, from breakingChange: ${breakingChange.impactedFiles?.length || 0}, from result: ${result?.downstreamComponents?.length || 0}`);
+            
+            if (impactedFiles && impactedFiles.length > 0) {
+                const filesItem = new ImpactViewItem(
+                    `📦 Downstream Impact (${impactedFiles.length})`,
+                    'breaking-change-impact-files',
+                    vscode.TreeItemCollapsibleState.Collapsed
+                );
+                filesItem.iconPath = new vscode.ThemeIcon('file');
+                filesItem.analysisResult = { breakingChange, filePath, impactedFiles, result };
+                items.push(filesItem);
+            }
+
+            // Get impacted tests - from breaking change or fallback to result
+            const impactedTests = breakingChange.impactedTests || (result ? (result.affectedTests || []) : []);
+            console.log(`[UI Impact] Impacted tests: ${impactedTests.length}, from breakingChange: ${breakingChange.impactedTests?.length || 0}, from result: ${result?.affectedTests?.length || 0}`);
+            
+            if (impactedTests && impactedTests.length > 0) {
+                const testsItem = new ImpactViewItem(
+                    `🧪 Test Impact (${impactedTests.length})`,
+                    'breaking-change-impact-tests',
+                    vscode.TreeItemCollapsibleState.Collapsed
+                );
+                testsItem.iconPath = new vscode.ThemeIcon('beaker');
+                testsItem.analysisResult = { breakingChange, filePath, impactedTests, result };
+                items.push(testsItem);
+            }
+
+            if (breakingChange.symbolKind === 'function' || breakingChange.symbolKind === 'method') {
+                const usageItem = new ImpactViewItem(
+                    `🧩 Function Impact: ${breakingChange.symbolName}() callers may break`,
+                    'breaking-change-impact-usage',
+                    vscode.TreeItemCollapsibleState.None
+                );
+                usageItem.iconPath = new vscode.ThemeIcon('symbol-function');
+                items.push(usageItem);
+            }
+
+            return items;
+        } else if (detailElement.type === 'breaking-change-impact-files') {
+            // List impacted files with navigation
+            const breakingChange = context.breakingChange;
+            const filePath = context.filePath || '';
+            const result = context.result || inferredResult;
+            const locations = breakingChange?.impactedFileLocations || [];
+            
+            // Get impacted files from context or fallback to result
+            const impactedFiles = context.impactedFiles || breakingChange?.impactedFiles || (result ? (result.downstreamComponents || []) : []);
+            
+            for (const impactedFile of impactedFiles) {
+                const location = locations.find((loc: { filePath: string; line: number; column: number }) => loc.filePath === impactedFile);
+                
+                const fileItem = new ImpactViewItem(
+                    path.basename(impactedFile),
+                    'breaking-change-impact-files',
+                    vscode.TreeItemCollapsibleState.None
+                );
+                fileItem.description = location 
+                    ? `Line ${location.line}` 
+                    : path.relative(path.dirname(filePath), impactedFile);
+                fileItem.iconPath = new vscode.ThemeIcon('file');
+                
+                if (location && location.line > 0) {
+                    fileItem.command = {
+                        command: 'vscode.open',
+                        title: 'Go to Usage',
+                        arguments: [
+                            vscode.Uri.file(impactedFile),
+                            { 
+                                selection: new vscode.Range(
+                                    location.line - 1, 
+                                    location.column - 1, 
+                                    location.line - 1, 
+                                    location.column - 1
+                                )
+                            }
+                        ]
+                    };
+                } else {
+                    fileItem.command = {
+                        command: 'vscode.open',
+                        title: 'Open File',
+                        arguments: [vscode.Uri.file(impactedFile)]
+                    };
+                }
+                items.push(fileItem);
+            }
+            return items;
+        } else if (detailElement.type === 'breaking-change-impact-tests') {
+            // List impacted tests
+            const breakingChange = context.breakingChange;
+            const filePath = context.filePath || '';
+            const result = context.result || inferredResult;
+
+            // Get impacted tests from context or fallback to result
+            const impactedTests = context.impactedTests || breakingChange?.impactedTests || (result ? (result.affectedTests || []) : []);
+
+            for (const testFile of impactedTests) {
+                const testItem = new ImpactViewItem(
+                    path.basename(testFile),
+                    'breaking-change-impact-tests',
+                    vscode.TreeItemCollapsibleState.None
+                );
+                testItem.description = path.relative(path.dirname(filePath), testFile);
+                testItem.iconPath = new vscode.ThemeIcon('beaker');
+                testItem.command = {
+                    command: 'vscode.open',
+                    title: 'Open Test',
+                    arguments: [vscode.Uri.file(testFile)]
+                };
+                items.push(testItem);
+            }
+            return items;
+        } else if (detailElement.type === 'breaking-change-actions') {
+            // Show recommended actions
+            const breakingChange = context.breakingChange;
+            const actions = this.getRecommendedActions(breakingChange);
+            
+            for (const action of actions) {
+                const actionItem = new ImpactViewItem(
+                    `• ${action}`,
+                    'breaking-change-actions',
+                    vscode.TreeItemCollapsibleState.None
+                );
+                actionItem.iconPath = new vscode.ThemeIcon('lightbulb');
+                items.push(actionItem);
+            }
+            return items;
+        } else if (detailElement.type === 'breaking-change-evidence') {
+            // Show evidence - description only, no before/after highlights
+            const breakingChange = context.breakingChange;
+            const evidenceItem = new ImpactViewItem(
+                this.formatBreakingChangeDescription(breakingChange),
+                'breaking-change-evidence',
+                vscode.TreeItemCollapsibleState.None
+            );
+            evidenceItem.iconPath = new vscode.ThemeIcon('note');
+            evidenceItem.tooltip = this.buildBreakingChangeDetailTooltip(breakingChange);
+            items.push(evidenceItem);
+            return items;
+        } else if (detailElement.type === 'ts-breaking-change') {
+            // Legacy handler - keep for backward compatibility but shouldn't be used
+            const breakingChange = context.breakingChange;
+            const filePath = context.filePath || inferredResult?.filePath || '';
+            
+            if (!breakingChange) {
+                return items;
+            }
+
+            // Breaking Change section - use description only, no before/after highlights
+            const changeDesc = this.formatBreakingChangeDescription(breakingChange);
+            
+            const changeItem = new ImpactViewItem(
+                'Breaking Change',
+                'ts-breaking-detail',
+                vscode.TreeItemCollapsibleState.None
+            );
+            changeItem.description = changeDesc;
+            changeItem.tooltip = this.buildBreakingChangeDetailTooltip(breakingChange);
+            changeItem.analysisResult = { breakingChange, filePath, section: 'change' };
+            changeItem.iconPath = new vscode.ThemeIcon('edit');
+            items.push(changeItem);
+
+            // Impact section
+            const impactItem = new ImpactViewItem(
+                'Impact',
+                'ts-breaking-detail',
+                vscode.TreeItemCollapsibleState.Collapsed
+            );
+            impactItem.description = this.formatImpactSummary(breakingChange);
+            impactItem.analysisResult = { breakingChange, filePath, section: 'impact' };
+            impactItem.iconPath = new vscode.ThemeIcon('arrow-down');
+            items.push(impactItem);
+
+            // Recommended Action section
+            const actionItem = new ImpactViewItem(
+                'Recommended Action',
+                'ts-breaking-detail',
+                vscode.TreeItemCollapsibleState.Collapsed
+            );
+            actionItem.description = `${this.getRecommendedActions(breakingChange).length} suggestion(s)`;
+            actionItem.analysisResult = { breakingChange, filePath, section: 'actions' };
+            actionItem.iconPath = new vscode.ThemeIcon('lightbulb');
+            items.push(actionItem);
+
+            // Location (if available)
+            if (breakingChange.span && breakingChange.span.start > 0) {
+                const locationItem = new ImpactViewItem(
+                    'Location',
+                    'ts-breaking-detail',
+                    vscode.TreeItemCollapsibleState.None
+                );
+                const lineNumber = this.getLineNumberFromSpan(breakingChange.span, filePath);
+                locationItem.description = lineNumber > 0 ? `Line ${lineNumber}` : `Position ${breakingChange.span.start}`;
+                locationItem.analysisResult = { breakingChange, filePath, section: 'location' };
+                locationItem.iconPath = new vscode.ThemeIcon('location');
+                if (lineNumber > 0) {
+                    locationItem.command = {
+                        command: 'vscode.open',
+                        title: 'Go to Line',
+                        arguments: [
+                            vscode.Uri.file(filePath),
+                            { selection: new vscode.Range(lineNumber - 1, 0, lineNumber - 1, 0) }
+                        ]
+                    };
+                }
+                items.push(locationItem);
+            }
+        } else if (detailElement.type === 'ts-breaking-detail') {
+            // Show details for each section
+            const breakingChange = context.breakingChange;
+            const section = context.section;
+            const filePath = context.filePath || '';
+
+            if (!breakingChange || !section) {
+                return items;
+            }
+
+            if (section === 'impact') {
+                // Show impacted files - labeled as "Downstream Impact" not "will break"
+                if (breakingChange.impactedFiles && breakingChange.impactedFiles.length > 0) {
+                    const filesItem = new ImpactViewItem(
+                        `📦 Downstream Impact (${breakingChange.impactedFiles.length})`,
+                        'ts-breaking-detail',
+                        vscode.TreeItemCollapsibleState.Collapsed
+                    );
+                    filesItem.iconPath = new vscode.ThemeIcon('file');
+                    filesItem.analysisResult = { breakingChange, filePath, section: 'impact-files' };
+                    items.push(filesItem);
+                }
+
+                // Show impacted tests - labeled as "Test Impact" not "will break"
+                if (breakingChange.impactedTests && breakingChange.impactedTests.length > 0) {
+                    const testsItem = new ImpactViewItem(
+                        `🧪 Test Impact (${breakingChange.impactedTests.length})`,
+                        'ts-breaking-detail',
+                        vscode.TreeItemCollapsibleState.Collapsed
+                    );
+                    testsItem.iconPath = new vscode.ThemeIcon('beaker');
+                    testsItem.analysisResult = { breakingChange, filePath, section: 'impact-tests' };
+                    items.push(testsItem);
+                }
+
+                // Show affected functions - labeled as "Function Impact" not "will break"
+                if (breakingChange.symbolKind === 'function' || breakingChange.symbolKind === 'method') {
+                    const funcItem = new ImpactViewItem(
+                        `🧩 Function Impact: ${breakingChange.symbolName}() callers may break`,
+                        'ts-breaking-detail',
+                        vscode.TreeItemCollapsibleState.None
+                    );
+                    funcItem.iconPath = new vscode.ThemeIcon('symbol-function');
+                    items.push(funcItem);
+                }
+            } else if (section === 'impact-files') {
+                // List impacted files with navigation to usage location
+                const impactedFiles = breakingChange.impactedFiles || [];
+                const locations = breakingChange.impactedFileLocations || [];
+                
+                for (let i = 0; i < impactedFiles.length; i++) {
+                    const impactedFile = impactedFiles[i];
+                    const location = locations.find((loc: { filePath: string; line: number; column: number }) => loc.filePath === impactedFile);
+                    
+                    const fileItem = new ImpactViewItem(
+                        path.basename(impactedFile),
+                        'ts-breaking-detail',
+                        vscode.TreeItemCollapsibleState.None
+                    );
+                    fileItem.description = location 
+                        ? `Line ${location.line}` 
+                        : path.relative(path.dirname(filePath), impactedFile);
+                    fileItem.iconPath = new vscode.ThemeIcon('file');
+                    
+                    // Navigate to the usage location if available
+                    if (location && location.line > 0) {
+                        fileItem.command = {
+                            command: 'vscode.open',
+                            title: 'Go to Usage',
+                            arguments: [
+                                vscode.Uri.file(impactedFile),
+                                { 
+                                    selection: new vscode.Range(
+                                        location.line - 1, 
+                                        location.column - 1, 
+                                        location.line - 1, 
+                                        location.column - 1
+                                    )
+                                }
+                            ]
+                        };
+                    } else {
+                        // Fallback: just open the file
+                        fileItem.command = {
+                            command: 'vscode.open',
+                            title: 'Open File',
+                            arguments: [vscode.Uri.file(impactedFile)]
+                        };
+                    }
+                    items.push(fileItem);
+                }
+            } else if (section === 'impact-tests') {
+                // List impacted tests
+                for (const testFile of breakingChange.impactedTests || []) {
+                    const testItem = new ImpactViewItem(
+                        path.basename(testFile),
+                        'ts-breaking-detail',
+                        vscode.TreeItemCollapsibleState.None
+                    );
+                    testItem.description = path.relative(path.dirname(filePath), testFile);
+                    testItem.iconPath = new vscode.ThemeIcon('beaker');
+                    testItem.command = {
+                        command: 'vscode.open',
+                        title: 'Open Test',
+                        arguments: [vscode.Uri.file(testFile)]
+                    };
+                    items.push(testItem);
+                }
+            } else if (section === 'actions') {
+                // Show recommended actions
+                const actions = this.getRecommendedActions(breakingChange);
+                for (const action of actions) {
+                    const actionItem = new ImpactViewItem(
+                        `• ${action}`,
+                        'ts-breaking-detail',
+                        vscode.TreeItemCollapsibleState.None
+                    );
+                    actionItem.iconPath = new vscode.ThemeIcon('lightbulb');
+                    items.push(actionItem);
+                }
             }
         } else if (detailElement.type === 'delta-summary') {
             const delta: ImpactDeltaSummary | undefined = context.delta;
@@ -2281,5 +2828,307 @@ export class SimpleImpactViewProvider implements vscode.TreeDataProvider<ImpactV
             this.testResults.set(result.testFile, result);
         }
         this.refresh();
+    }
+
+    /**
+     * Calculate risk level from breaking changes
+     * Severity mapping (non-negotiable):
+     * Critical: TSAPI-EXP-001, TSAPI-CLS-001, TSX-CMP-002
+     * Medium: TSAPI-FN-001, TSAPI-FN-002, TSAPI-TYP-001, TSAPI-TYP-002, TSX-CMP-001, TSAPI-EXP-002
+     */
+    private calculateRiskFromBreakingChanges(breakingChanges: any[]): 'low' | 'medium' | 'high' {
+        // Critical risk rules
+        const criticalRiskRules = ['TSAPI-EXP-001', 'TSAPI-CLS-001', 'TSX-CMP-002'];
+        // Medium risk rules
+        const mediumRiskRules = ['TSAPI-FN-001', 'TSAPI-FN-002', 'TSAPI-TYP-001', 'TSAPI-TYP-002', 'TSX-CMP-001', 'TSAPI-EXP-002'];
+        
+        // If any breaking change is critical, return high
+        if (breakingChanges.some(c => criticalRiskRules.includes(c.ruleId))) {
+            return 'high';
+        }
+        // If any breaking change is medium, return medium
+        if (breakingChanges.some(c => mediumRiskRules.includes(c.ruleId))) {
+            return 'medium';
+        }
+        // Default to low for any other rules
+        return 'low';
+    }
+
+    /**
+     * Check if a rule is critical (high risk)
+     */
+    private isCriticalRule(ruleId: string): boolean {
+        return ['TSAPI-EXP-001', 'TSAPI-CLS-001', 'TSX-CMP-002'].includes(ruleId);
+    }
+
+    /**
+     * Format breaking change node label with rule title and ID
+     */
+    private formatBreakingChangeNodeLabel(change: any): string {
+        const title = this.getRuleShortTitle(change.ruleId);
+        const icon = this.isCriticalRule(change.ruleId) ? '🚨' : '⚠️';
+        return `${icon} ${title} — ${change.symbolName} (${change.ruleId})`;
+    }
+
+    /**
+     * Format breaking change node description
+     */
+    private formatBreakingChangeNodeDescription(change: any): string {
+        // Keep short, put before/after in Evidence node tooltip
+        return this.formatBreakingChangeDescription(change);
+    }
+
+    /**
+     * Get short title for a rule ID
+     */
+    private getRuleShortTitle(ruleId: string): string {
+        const map: Record<string, string> = {
+            'TSAPI-EXP-001': 'Export removed',
+            'TSAPI-EXP-002': 'Export kind changed',
+            'TSAPI-FN-001': 'Signature became stricter',
+            'TSAPI-FN-002': 'Parameter type narrowed',
+            'TSAPI-CLS-001': 'Class member removed/privatized',
+            'TSAPI-TYP-001': 'Required property added/made required',
+            'TSAPI-TYP-002': 'Property removed/narrowed',
+            'TSX-CMP-001': 'Component props became stricter',
+            'TSX-CMP-002': 'Component removed'
+        };
+        return map[ruleId] || 'Breaking change';
+    }
+
+    /**
+     * Format breaking change description
+     */
+    private formatBreakingChangeDescription(change: any): string {
+        const symbolKindLabel = this.getSymbolKindLabel(change.symbolKind);
+        const changeKindLabel = this.getChangeKindLabel(change.changeKind);
+        
+        if (change.memberName) {
+            return `${symbolKindLabel} \`${change.symbolName}\` ${changeKindLabel}: \`${change.memberName}\``;
+        }
+        return `${symbolKindLabel} \`${change.symbolName}\` ${changeKindLabel}`;
+    }
+
+    /**
+     * Get human-readable symbol kind label
+     */
+    private getSymbolKindLabel(symbolKind: string): string {
+        const labels: Record<string, string> = {
+            'function': 'Function',
+            'class': 'Class',
+            'type': 'Type',
+            'enum': 'Enum',
+            'value': 'Value',
+            'component': 'Component',
+            'method': 'Method',
+            'property': 'Property'
+        };
+        return labels[symbolKind] || symbolKind;
+    }
+
+    /**
+     * Get human-readable change kind label
+     */
+    private getChangeKindLabel(changeKind: string): string {
+        const labels: Record<string, string> = {
+            'export_removed': 'was removed',
+            'export_kind_changed': 'export kind changed',
+            'signature_required_param_added': 'parameter became required',
+            'signature_param_became_required': 'parameter became required',
+            'signature_param_type_narrowed': 'parameter type narrowed',
+            'class_member_removed_or_privatised': 'member removed or privatised',
+            'type_required_prop_added_or_made_required': 'property became required',
+            'type_prop_removed_or_narrowed': 'property removed or narrowed',
+            'component_props_stricter': 'props became stricter',
+            'component_removed': 'was removed'
+        };
+        return labels[changeKind] || changeKind;
+    }
+
+    /**
+     * Format breaking change description with before/after
+     */
+    private formatBreakingChangeWithBeforeAfter(change: any): string {
+        if (change.before && change.after) {
+            // For signature changes, show the actual before/after in a readable format
+            if (change.changeKind === 'signature_required_param_added' || 
+                change.changeKind === 'signature_param_became_required' ||
+                change.changeKind === 'signature_param_type_narrowed') {
+                // Extract parameter name from before/after if available
+                const beforeMatch = change.before.match(/(\w+)(\??):/);
+                const afterMatch = change.after.match(/(\w+)(\??):/);
+                
+                if (beforeMatch && afterMatch && beforeMatch[1] === afterMatch[1]) {
+                    // Same parameter name, show the change
+                    const paramName = beforeMatch[1];
+                    const beforeType = change.before.replace(`${paramName}${beforeMatch[2]}:`, '').trim();
+                    const afterType = change.after.replace(`${paramName}${afterMatch[2]}:`, '').trim();
+                    return `${change.symbolName}(${change.before}) → ${change.symbolName}(${change.after})`;
+                }
+                return `${change.symbolName}(${change.before}) → ${change.symbolName}(${change.after})`;
+            }
+        }
+        return this.formatBreakingChangeDescription(change);
+    }
+
+    /**
+     * Format impact summary
+     */
+    private formatImpactSummary(change: any): string {
+        const parts: string[] = [];
+        
+        if (change.impactedFiles && change.impactedFiles.length > 0) {
+            parts.push(`${change.impactedFiles.length} downstream file${change.impactedFiles.length !== 1 ? 's' : ''}`);
+        }
+        
+        if (change.impactedTests && change.impactedTests.length > 0) {
+            parts.push(`${change.impactedTests.length} affected test${change.impactedTests.length !== 1 ? 's' : ''}`);
+        }
+        
+        if (change.symbolKind === 'function' || change.symbolKind === 'method') {
+            parts.push(`1 function affected`);
+        }
+        
+        return parts.length > 0 ? parts.join(', ') : 'No impact detected';
+    }
+
+    /**
+     * Get recommended actions for a breaking change
+     */
+    private getRecommendedActions(change: any): string[] {
+        const actions: string[] = [];
+        
+        switch (change.changeKind) {
+            case 'signature_required_param_added':
+            case 'signature_param_became_required':
+                actions.push('Update callers to pass the required parameter');
+                actions.push('OR add default value to the parameter');
+                actions.push('OR add overload to preserve backward compatibility');
+                break;
+                
+            case 'signature_param_type_narrowed':
+                actions.push('Update callers to use the narrowed type');
+                actions.push('OR widen the parameter type if possible');
+                break;
+                
+            case 'export_removed':
+            case 'component_removed':
+                actions.push('Restore the export if it\'s still needed');
+                actions.push('OR update all importers to use alternative');
+                actions.push('OR mark as deprecated first, then remove in next version');
+                break;
+                
+            case 'class_member_removed_or_privatised':
+                actions.push('Restore the member if it\'s still needed');
+                actions.push('OR update all usages to use alternative');
+                actions.push('OR add a public getter/setter if access is needed');
+                break;
+                
+            case 'type_required_prop_added_or_made_required':
+                actions.push('Update all usages to provide the required property');
+                actions.push('OR make the property optional if possible');
+                break;
+                
+            case 'type_prop_removed_or_narrowed':
+                actions.push('Restore the property if it\'s still needed');
+                actions.push('OR update all usages to use alternative');
+                break;
+                
+            case 'component_props_stricter':
+                actions.push('Update all component usages to provide required props');
+                actions.push('OR make props optional if possible');
+                break;
+                
+            default:
+                actions.push('Review the change and update affected code');
+                actions.push('Consider maintaining backward compatibility');
+        }
+        
+        return actions;
+    }
+
+    /**
+     * Build tooltip for breaking changes summary
+     */
+    private buildBreakingChangesTooltip(breakingChanges: any[], result: ImpactAnalysisResult, riskLevel: string, impactedFiles: number, impactedTests: number, affectedFunctions: number): string {
+        const lines: string[] = [];
+        lines.push(`${path.basename(result.filePath)}`);
+        lines.push(`${breakingChanges.length} breaking change${breakingChanges.length !== 1 ? 's' : ''} detected (${riskLevel} risk)`);
+        lines.push('');
+        
+        const summaryParts: string[] = [];
+        if (affectedFunctions > 0) summaryParts.push(`${affectedFunctions} function${affectedFunctions !== 1 ? 's' : ''}`);
+        if (impactedTests > 0) summaryParts.push(`${impactedTests} test${impactedTests !== 1 ? 's' : ''}`);
+        if (impactedFiles > 0) summaryParts.push(`${impactedFiles} downstream file${impactedFiles !== 1 ? 's' : ''}`);
+        
+        if (summaryParts.length > 0) {
+            lines.push(`Impact: ${summaryParts.join(', ')}`);
+            lines.push('');
+        }
+        
+        for (const change of breakingChanges.slice(0, 3)) {
+            lines.push(`• ${this.formatBreakingChangeDescription(change)}`);
+        }
+        
+        if (breakingChanges.length > 3) {
+            lines.push(`... and ${breakingChanges.length - 3} more`);
+        }
+        
+        return lines.join('\n');
+    }
+
+    /**
+     * Build tooltip for individual breaking change
+     */
+    private buildBreakingChangeTooltip(change: any, filePath: string): string {
+        const lines: string[] = [];
+        lines.push(this.formatBreakingChangeDescription(change));
+        
+        if (change.before && change.after) {
+            lines.push('');
+            lines.push(`Before: ${change.before}`);
+            lines.push(`After:  ${change.after}`);
+        }
+        
+        if (change.impactedFiles && change.impactedFiles.length > 0) {
+            lines.push('');
+            lines.push(`Impact: ${change.impactedFiles.length} file${change.impactedFiles.length !== 1 ? 's' : ''}`);
+        }
+        
+        return lines.join('\n');
+    }
+
+    /**
+     * Build detailed tooltip for breaking change
+     */
+    private buildBreakingChangeDetailTooltip(change: any): string {
+        const lines: string[] = [];
+        lines.push('Breaking Change');
+        lines.push('──────────────');
+        lines.push(this.formatBreakingChangeDescription(change));
+        
+        if (change.before && change.after) {
+            lines.push('');
+            lines.push(`Before: ${change.before}`);
+            lines.push(`After:  ${change.after}`);
+        }
+        
+        return lines.join('\n');
+    }
+
+    /**
+     * Get line number from span
+     */
+    private getLineNumberFromSpan(span: { start: number; end: number }, filePath: string): number {
+        try {
+            if (!fs.existsSync(filePath)) {
+                return 0;
+            }
+            const content = fs.readFileSync(filePath, 'utf8');
+            const lines = content.substring(0, span.start).split('\n');
+            return lines.length;
+        } catch {
+            return 0;
+        }
     }
 }
